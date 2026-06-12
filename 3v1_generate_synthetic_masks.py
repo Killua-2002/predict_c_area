@@ -1,20 +1,28 @@
 """
 3v1_generate_synthetic_masks.py
-Generate 5,000 realistic chromosome overlap samples for missing-part prediction.
+Fast parallel version for generating realistic chromosome overlap samples.
 
-Final logic:
+What changed vs the slow version:
+- Uses ThreadPoolExecutor (--workers) to generate/save samples concurrently.
+- Uses low PNG compression by default (--png-compress-level 1) to avoid wasting CPU time.
+- Skips preview images by default because previews are not used for training.
+  Use --preview-mode all or --preview-mode first if you need QC previews.
+
+Final logic is unchanged:
 - No thick border/contour is drawn into train images or masks.
-- The overlap region C is rendered by blending only the top chromosome inside C at 50% opacity
-  with soft edge/blur, similar to a Photoshop opacity/filter layer.
-- Saves: full masks A/B/C, visible A/B, missing gaps A/B, and top-order labels.
+- C = A & B.
+- In C, the top chromosome is blended at 50% opacity with soft edge/blur.
+- Saves full masks A/B/C, visible A/B, missing gaps A/B, and top-order labels.
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import os
 import random
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2
@@ -93,7 +101,7 @@ def extract_chromosome_object(image_path: Path):
         bg_gray = float(np.mean(bg_color))
         mask = (diff > BACKGROUND_DIFF_THRESHOLD) | (gray < bg_gray - 8)
 
-    mask_uint8 = (mask.astype(np.uint8) * 255)
+    mask_uint8 = mask.astype(np.uint8) * 255
     kernel = np.ones((3, 3), np.uint8)
     mask_uint8 = cv2.morphologyEx(mask_uint8, cv2.MORPH_OPEN, kernel)
     mask_uint8 = cv2.morphologyEx(mask_uint8, cv2.MORPH_CLOSE, kernel)
@@ -105,7 +113,6 @@ def extract_chromosome_object(image_path: Path):
     ys, xs = np.where(mask)
     x1, x2 = xs.min(), xs.max()
     y1, y2 = ys.min(), ys.max()
-    # No thick border: only crop exactly around the detected object with tiny safe pad.
     pad = 1
     x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
     x2, y2 = min(w - 1, x2 + pad), min(h - 1, y2 + pad)
@@ -120,7 +127,7 @@ def extract_chromosome_object(image_path: Path):
     return (
         image_path,
         Image.fromarray(obj_rgba_arr, "RGBA"),
-        Image.fromarray((cropped_mask.astype(np.uint8) * 255), "L"),
+        Image.fromarray(cropped_mask.astype(np.uint8) * 255, "L"),
     )
 
 
@@ -197,7 +204,8 @@ def alpha_over(base_rgb: np.ndarray, top_rgba: np.ndarray, alpha_override: np.nd
     return np.clip(top_rgb * alpha + base * (1.0 - alpha), 0, 255).astype(np.uint8)
 
 
-def composite_realistic(layer_A: Image.Image, layer_B: Image.Image, mask_A: Image.Image, mask_B: Image.Image, top_label: str):
+def composite_realistic(layer_A: Image.Image, layer_B: Image.Image, mask_A: Image.Image, mask_B: Image.Image,
+                        top_label: str, rng: random.Random, np_rng: np.random.Generator):
     A = np.array(mask_A) > 0
     B = np.array(mask_B) > 0
     C = A & B
@@ -206,24 +214,21 @@ def composite_realistic(layer_A: Image.Image, layer_B: Image.Image, mask_A: Imag
     arr_B = np.array(layer_B.convert("RGBA"))
     lower_rgba, top_rgba = (arr_B, arr_A) if top_label == "A_ON_TOP" else (arr_A, arr_B)
 
-    # 1) lower chromosome fully visible
     out = alpha_over(base, lower_rgba)
 
-    # 2) only inside C, blend the top chromosome at 50% opacity with soft boundary
     c_soft = np.array(
-        Image.fromarray((C.astype(np.uint8) * 255), "L").filter(ImageFilter.GaussianBlur(radius=SOFT_EDGE_BLUR_RADIUS))
+        Image.fromarray(C.astype(np.uint8) * 255, "L").filter(ImageFilter.GaussianBlur(radius=SOFT_EDGE_BLUR_RADIUS))
     ).astype(np.float32) / 255.0
     alpha_factor = 1.0 - c_soft * (1.0 - TOP_OPACITY_IN_C)
 
-    # slight texture blur inside C to reduce fake hard crossing edge
     top_blur = np.array(Image.fromarray(top_rgba[:, :, :3], "RGB").filter(ImageFilter.GaussianBlur(radius=1.15))).astype(np.uint8)
     c3 = c_soft[:, :, None]
     top_rgba_soft = top_rgba.copy()
     top_rgba_soft[:, :, :3] = np.clip(top_rgba[:, :, :3] * (1 - c3) + top_blur * c3, 0, 255).astype(np.uint8)
     out = alpha_over(out, top_rgba_soft, alpha_override=alpha_factor)
 
-    if random.random() < NOISE_PROB:
-        out = np.clip(out.astype(np.float32) + np.random.normal(0, NOISE_STD, out.shape), 0, 255).astype(np.uint8)
+    if rng.random() < NOISE_PROB:
+        out = np.clip(out.astype(np.float32) + np_rng.normal(0, NOISE_STD, out.shape), 0, 255).astype(np.uint8)
     return Image.fromarray(out, "RGB"), C
 
 
@@ -239,20 +244,20 @@ def make_preview(image: Image.Image, mask_A: Image.Image, mask_B: Image.Image, m
     return Image.fromarray(np.clip(overlay, 0, 255).astype(np.uint8), "RGB")
 
 
-def make_sample(item_A, item_B):
+def make_sample(item_A, item_B, rng: random.Random, np_rng: np.random.Generator):
     path_A, obj_A, mask_A = item_A
     path_B, obj_B, mask_B = item_B
-    target_A = random.randint(TARGET_LONG_SIDE_MIN, TARGET_LONG_SIDE_MAX)
-    target_B = random.randint(TARGET_LONG_SIDE_MIN, TARGET_LONG_SIDE_MAX)
+    target_A = rng.randint(TARGET_LONG_SIDE_MIN, TARGET_LONG_SIDE_MAX)
+    target_B = rng.randint(TARGET_LONG_SIDE_MIN, TARGET_LONG_SIDE_MAX)
     obj_A, mask_A = resize_keep_ratio(obj_A, mask_A, target_A)
     obj_B, mask_B = resize_keep_ratio(obj_B, mask_B, target_B)
-    obj_A, mask_A = rotate_pair(obj_A, mask_A, 90 + random.uniform(-10, 10))
-    obj_B, mask_B = rotate_pair(obj_B, mask_B, random.uniform(-10, 10))
+    obj_A, mask_A = rotate_pair(obj_A, mask_A, 90 + rng.uniform(-10, 10))
+    obj_B, mask_B = rotate_pair(obj_B, mask_B, rng.uniform(-10, 10))
 
-    center_x = CANVAS_SIZE // 2 + random.randint(-16, 16)
-    center_y = CANVAS_SIZE // 2 + random.randint(-16, 16)
-    A_cx, A_cy = center_x + random.randint(-20, 20), center_y + random.randint(-12, 12)
-    B_cx, B_cy = center_x + random.randint(-12, 12), center_y + random.randint(-20, 20)
+    center_x = CANVAS_SIZE // 2 + rng.randint(-16, 16)
+    center_y = CANVAS_SIZE // 2 + rng.randint(-16, 16)
+    A_cx, A_cy = center_x + rng.randint(-20, 20), center_y + rng.randint(-12, 12)
+    B_cx, B_cy = center_x + rng.randint(-12, 12), center_y + rng.randint(-20, 20)
     layer_A, mask_A_canvas = paste_to_rgba_canvas(obj_A, mask_A, A_cx, A_cy)
     layer_B, mask_B_canvas = paste_to_rgba_canvas(obj_B, mask_B, B_cx, B_cy)
 
@@ -265,8 +270,8 @@ def make_sample(item_A, item_B):
     if overlap_pixels < MIN_OVERLAP_PIXELS or overlap_ratio > MAX_OVERLAP_RATIO:
         return None
 
-    top_label = "A_ON_TOP" if random.random() < 0.5 else "B_ON_TOP"
-    final_image, C_arr = composite_realistic(layer_A, layer_B, mask_A_canvas, mask_B_canvas, top_label)
+    top_label = "A_ON_TOP" if rng.random() < 0.5 else "B_ON_TOP"
+    final_image, C_arr = composite_realistic(layer_A, layer_B, mask_A_canvas, mask_B_canvas, top_label, rng, np_rng)
     if top_label == "A_ON_TOP":
         visible_A = A_arr
         visible_B = B_arr & (~C_arr)
@@ -282,11 +287,11 @@ def make_sample(item_A, item_B):
         "image": final_image,
         "mask_A": mask_A_canvas,
         "mask_B": mask_B_canvas,
-        "mask_C": Image.fromarray((C_arr.astype(np.uint8) * 255), "L"),
-        "visible_A": Image.fromarray((visible_A.astype(np.uint8) * 255), "L"),
-        "visible_B": Image.fromarray((visible_B.astype(np.uint8) * 255), "L"),
-        "gap_A": Image.fromarray((gap_A.astype(np.uint8) * 255), "L"),
-        "gap_B": Image.fromarray((gap_B.astype(np.uint8) * 255), "L"),
+        "mask_C": Image.fromarray(C_arr.astype(np.uint8) * 255, "L"),
+        "visible_A": Image.fromarray(visible_A.astype(np.uint8) * 255, "L"),
+        "visible_B": Image.fromarray(visible_B.astype(np.uint8) * 255, "L"),
+        "gap_A": Image.fromarray(gap_A.astype(np.uint8) * 255, "L"),
+        "gap_B": Image.fromarray(gap_B.astype(np.uint8) * 255, "L"),
         "source_A": path_A.name,
         "source_B": path_B.name,
         "top_label": top_label,
@@ -296,52 +301,48 @@ def make_sample(item_A, item_B):
     }
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--num-samples", type=int, default=5000)
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--clear-old", action="store_true", default=True)
-    ap.add_argument("--no-clear-old", dest="clear_old", action="store_false")
-    ap.add_argument("--progress-every", type=int, default=100)
-    ap.add_argument("--max-attempts-factor", type=int, default=80)
-    args = ap.parse_args()
+def save_png(img: Image.Image, path: Path, compress_level: int) -> None:
+    # Lower compression is much faster. Training does not care about PNG file size.
+    img.save(path, format="PNG", compress_level=int(compress_level), optimize=False)
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    reset_output(args.clear_old)
 
-    print("=" * 80)
-    print("3v1 GENERATE REALISTIC SYNTHETIC OVERLAP DATASET")
-    print("=" * 80)
-    print(f"Samples target : {args.num_samples}")
-    print(f"Output folder  : {OUT_ROOT}")
-    print("Logic          : no contour; C region uses 50% opacity top-layer blend")
+def should_save_preview(index: int, preview_mode: str, preview_first: int) -> bool:
+    if preview_mode == "all":
+        return True
+    if preview_mode == "first" and index <= preview_first:
+        return True
+    return False
 
-    objects = load_source_objects(progress_every=max(100, args.progress_every))
-    rows = []
-    created = 0
+
+def worker_make_and_save(index: int, seed: int, objects, max_attempts_per_sample: int,
+                         preview_mode: str, preview_first: int, png_compress_level: int):
+    # Different deterministic RNG per sample index, safe for parallel execution.
+    local_seed = int(seed) + int(index) * 1_000_003
+    rng = random.Random(local_seed)
+    np_rng = np.random.default_rng(local_seed)
+
     attempts = 0
-    max_attempts = args.num_samples * args.max_attempts_factor
-    t0 = time.time()
-
-    while created < args.num_samples and attempts < max_attempts:
-        attempts += 1
-        item_A, item_B = random.sample(objects, 2)
-        sample = make_sample(item_A, item_B)
+    for attempts in range(1, max_attempts_per_sample + 1):
+        i_a, i_b = rng.sample(range(len(objects)), 2)
+        sample = make_sample(objects[i_a], objects[i_b], rng, np_rng)
         if sample is None:
             continue
-        created += 1
-        name = f"img_{created:06d}.png"
-        sample["image"].save(OUT_IMAGE_DIR / name)
-        sample["mask_A"].save(OUT_MASK_A_DIR / name)
-        sample["mask_B"].save(OUT_MASK_B_DIR / name)
-        sample["mask_C"].save(OUT_MASK_C_DIR / name)
-        sample["visible_A"].save(OUT_VISIBLE_A_DIR / name)
-        sample["visible_B"].save(OUT_VISIBLE_B_DIR / name)
-        sample["gap_A"].save(OUT_GAP_A_DIR / name)
-        sample["gap_B"].save(OUT_GAP_B_DIR / name)
-        make_preview(sample["image"], sample["mask_A"], sample["mask_B"], sample["mask_C"]).save(OUT_PREVIEW_DIR / name)
-        rows.append({
+
+        name = f"img_{index:06d}.png"
+        save_png(sample["image"], OUT_IMAGE_DIR / name, png_compress_level)
+        save_png(sample["mask_A"], OUT_MASK_A_DIR / name, png_compress_level)
+        save_png(sample["mask_B"], OUT_MASK_B_DIR / name, png_compress_level)
+        save_png(sample["mask_C"], OUT_MASK_C_DIR / name, png_compress_level)
+        save_png(sample["visible_A"], OUT_VISIBLE_A_DIR / name, png_compress_level)
+        save_png(sample["visible_B"], OUT_VISIBLE_B_DIR / name, png_compress_level)
+        save_png(sample["gap_A"], OUT_GAP_A_DIR / name, png_compress_level)
+        save_png(sample["gap_B"], OUT_GAP_B_DIR / name, png_compress_level)
+
+        if should_save_preview(index, preview_mode, preview_first):
+            preview = make_preview(sample["image"], sample["mask_A"], sample["mask_B"], sample["mask_C"])
+            save_png(preview, OUT_PREVIEW_DIR / name, png_compress_level)
+
+        row = {
             "filename": name,
             "source_A": sample["source_A"],
             "source_B": sample["source_B"],
@@ -349,13 +350,96 @@ def main():
             "top_class": sample["top_class"],
             "overlap_pixels": sample["overlap_pixels"],
             "overlap_ratio": round(float(sample["overlap_ratio"]), 6),
-        })
-        if created % args.progress_every == 0 or created == args.num_samples:
-            rate = created / max(time.time() - t0, 1e-6)
-            print(f"[3v1] created={created}/{args.num_samples} attempts={attempts} rate={rate:.2f} img/s elapsed={time.time()-t0:.1f}s", flush=True)
+        }
+        return {"ok": True, "index": index, "attempts": attempts, "row": row, "error": ""}
 
+    return {"ok": False, "index": index, "attempts": attempts, "row": None, "error": "max attempts reached"}
+
+
+def positive_int(value: str) -> int:
+    ivalue = int(value)
+    if ivalue <= 0:
+        raise argparse.ArgumentTypeError("value must be > 0")
+    return ivalue
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--num-samples", type=positive_int, default=5000)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--clear-old", action="store_true", default=True)
+    ap.add_argument("--no-clear-old", dest="clear_old", action="store_false")
+    ap.add_argument("--progress-every", type=positive_int, default=100)
+    ap.add_argument("--max-attempts-per-sample", type=positive_int, default=80)
+    ap.add_argument("--workers", type=positive_int, default=max(2, min(8, (os.cpu_count() or 2))))
+    ap.add_argument("--png-compress-level", type=int, default=1, choices=list(range(10)))
+    ap.add_argument("--preview-mode", choices=["none", "first", "all"], default="none")
+    ap.add_argument("--preview-first", type=positive_int, default=60)
+    args = ap.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    reset_output(args.clear_old)
+
+    print("=" * 80)
+    print("3v1 GENERATE REALISTIC SYNTHETIC OVERLAP DATASET - PARALLEL FAST")
+    print("=" * 80)
+    print(f"Samples target    : {args.num_samples}")
+    print(f"Output folder     : {OUT_ROOT}")
+    print(f"Workers           : {args.workers}")
+    print(f"PNG compression   : {args.png_compress_level}  (lower = faster, bigger files)")
+    print(f"Preview mode      : {args.preview_mode}")
+    print("Logic             : no contour; C region uses 50% opacity top-layer blend")
+
+    objects = load_source_objects(progress_every=max(100, args.progress_every))
+
+    rows = []
+    created = 0
+    failed = 0
+    total_attempts = 0
+    t0 = time.time()
+
+    futures = []
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        for idx in range(1, args.num_samples + 1):
+            futures.append(executor.submit(
+                worker_make_and_save,
+                idx,
+                args.seed,
+                objects,
+                args.max_attempts_per_sample,
+                args.preview_mode,
+                args.preview_first,
+                args.png_compress_level,
+            ))
+
+        for fut in as_completed(futures):
+            result = fut.result()
+            total_attempts += int(result["attempts"])
+            if result["ok"]:
+                created += 1
+                rows.append(result["row"])
+            else:
+                failed += 1
+                if failed <= 20:
+                    print(f"[3v1][FAIL] index={result['index']:06d}: {result['error']}", flush=True)
+
+            done = created + failed
+            if created % args.progress_every == 0 or done == args.num_samples:
+                elapsed = time.time() - t0
+                rate = created / max(elapsed, 1e-6)
+                print(
+                    f"[3v1] created={created}/{args.num_samples} failed={failed} "
+                    f"attempts={total_attempts} rate={rate:.2f} img/s elapsed={elapsed:.1f}s",
+                    flush=True,
+                )
+
+    rows = sorted(rows, key=lambda r: r["filename"])
     with open(OUT_LABEL_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["filename", "source_A", "source_B", "top_label", "top_class", "overlap_pixels", "overlap_ratio"])
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["filename", "source_A", "source_B", "top_label", "top_class", "overlap_pixels", "overlap_ratio"],
+        )
         writer.writeheader()
         writer.writerows(rows)
 
@@ -363,10 +447,15 @@ def main():
     print("3v1 DONE")
     print("=" * 80)
     print(f"Created : {created}")
-    print(f"Attempts: {attempts}")
+    print(f"Failed  : {failed}")
+    print(f"Attempts: {total_attempts}")
     print(f"Labels  : {OUT_LABEL_CSV}")
+
     if created < args.num_samples:
-        raise RuntimeError(f"Only created {created}/{args.num_samples}. Try lowering MIN_OVERLAP_PIXELS or increasing --max-attempts-factor.")
+        raise RuntimeError(
+            f"Only created {created}/{args.num_samples}. "
+            f"Try increasing --max-attempts-per-sample or lowering MIN_OVERLAP_PIXELS."
+        )
 
 
 if __name__ == "__main__":
