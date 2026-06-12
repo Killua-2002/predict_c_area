@@ -13,9 +13,9 @@ Why this version exists:
 
 Output design:
 - predicted_masks/* stores binary black/white masks, useful as supplementary mask evidence.
-- predicted_original_canvas/* stores A/B/C/full A/full B cut from the original overlap image,
-  so the visible result is image-like, not only white masks on black background.
-- predicted_original_crop/* stores tight crops of the same original-image regions.
+- predicted_original_canvas/* stores A/B/C/full A/full B cut from the original overlap image
+  on a WHITE background, so the visible result is image-like and not black-background masks.
+- predicted_original_crop/* stores tight crops of the same original-image regions, also on WHITE background.
 """
 from __future__ import annotations
 
@@ -149,13 +149,23 @@ def save_gray01(arr: np.ndarray, path: Path) -> None:
     Image.fromarray((arr * 255).astype(np.uint8)).save(path)
 
 
-def original_region(gray_hw: np.ndarray, mask_hw: np.ndarray) -> np.ndarray:
-    """Return original-intensity object on black background, not a binary mask."""
-    return gray_hw.astype(np.float32) * (mask_hw > 0.5).astype(np.float32)
+def original_region(gray_hw: np.ndarray, mask_hw: np.ndarray, bg_value: float = 1.0) -> np.ndarray:
+    """
+    Return the NST region cut from the ORIGINAL grayscale image on a WHITE background.
+
+    Important for reporting:
+    - Pixels inside mask keep their original image intensity.
+    - Pixels outside mask become white, not black.
+    - Binary white-on-black masks are saved separately in predicted_masks only as supplementary evidence.
+    """
+    gray = np.clip(gray_hw.astype(np.float32), 0.0, 1.0)
+    mask = (mask_hw > 0.5).astype(np.float32)
+    return gray * mask + float(bg_value) * (1.0 - mask)
 
 
 def save_original_region(gray_hw: np.ndarray, mask_hw: np.ndarray, canvas_path: Path, crop_path: Path | None = None, pad: int = 3) -> None:
-    region = original_region(gray_hw, mask_hw)
+    # Full 256x256 canvas: original NST pixels on white background.
+    region = original_region(gray_hw, mask_hw, bg_value=1.0)
     save_gray01(region, canvas_path)
 
     if crop_path is None:
@@ -163,12 +173,13 @@ def save_original_region(gray_hw: np.ndarray, mask_hw: np.ndarray, canvas_path: 
     crop_path.parent.mkdir(parents=True, exist_ok=True)
     ys, xs = np.where(mask_hw > 0.5)
     if len(xs) == 0 or len(ys) == 0:
-        crop = np.zeros((16, 16), dtype=np.float32)
+        crop = np.ones((16, 16), dtype=np.float32)
     else:
         y0 = max(int(ys.min()) - pad, 0)
         y1 = min(int(ys.max()) + pad + 1, region.shape[0])
         x0 = max(int(xs.min()) - pad, 0)
         x1 = min(int(xs.max()) + pad + 1, region.shape[1])
+        # Tight crop: still original NST pixels on white background within the crop.
         crop = region[y0:y1, x0:x1]
     save_gray01(crop, crop_path)
 
@@ -549,7 +560,7 @@ def pass3_student_metrics_outputs(
             save_mask(rec_student[i, ..., 1], masks_root / "student_full_B" / stem)
 
             # Original-image regions: main qualitative result.
-            # A/B/C/full outputs are cut from the original overlap image, not plain white masks.
+            # A/B/C/full outputs are cut from the original overlap image on WHITE background; binary masks are supplementary only.
             region_items = {
                 "visible_A": pred_visible[i, ..., 0],
                 "visible_B": pred_visible[i, ..., 1],
@@ -669,7 +680,7 @@ def pass3_student_metrics_outputs(
         "student_mean_full_AB_dice_percent": float(mean_full_s * 100),
         "best_model_by_full_AB_dice": best,
         "output_note": (
-            "predicted_original_canvas and predicted_original_crop are cut from original overlap images; "
+            "predicted_original_canvas and predicted_original_crop are cut from original overlap images on white background; "
             "predicted_masks are binary masks for supplementary checking."
         ),
     }
