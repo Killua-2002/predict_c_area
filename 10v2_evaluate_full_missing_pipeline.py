@@ -269,7 +269,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset-dir", default="dataset")
     ap.add_argument("--results-dir", default="results")
-    ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--batch-size", type=int, default=40)
     ap.add_argument("--max-showcase", type=int, default=60)
     args = ap.parse_args()
 
@@ -288,9 +288,9 @@ def main():
 
     print("Loading data...")
     X, y_visible, y_full, y_gap, y_order, names = load_real_test(dataset_dir)
-    print(f"real_test samples: {len(names)}")
+    print(f"real_test samples: {len(names)} | Batch={args.batch_size}")
 
-    print("Loading models...")
+    print("Loading models from exact paths only, no recursive model search...")
     visible_model = keras.models.load_model(visible_model_path, compile=False, safe_mode=False)
     teacher = keras.models.load_model(teacher_path, compile=False, safe_mode=False)
     student = keras.models.load_model(student_path, compile=False, safe_mode=False)

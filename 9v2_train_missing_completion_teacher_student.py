@@ -119,7 +119,7 @@ def make_ds(dataset_dir: Path, split: str, role: str, batch: int, shuffle=False,
     loader = load_teacher if role == "teacher" else load_student
     ds = ds.map(loader, num_parallel_calls=tf.data.AUTOTUNE)
     if do_aug: ds = ds.map(augment, num_parallel_calls=tf.data.AUTOTUNE)
-    return ds.batch(batch).prefetch(1), len(rows)
+    return ds.batch(batch).prefetch(tf.data.AUTOTUNE), len(rows)
 
 
 def conv(x, f, drop=0):
@@ -260,14 +260,21 @@ def train_one(role, dataset_dir, out_dir, epochs, batch, base, lr, patience):
     model.compile(optimizer=keras.optimizers.Adam(lr), loss=gap_loss, metrics=[gap_dice])
     train_ds, nt = make_ds(dataset_dir, "train", role, batch, True, True)
     val_ds, nv = make_ds(dataset_dir, "val", role, batch)
-    print(f"[{role}] Train={nt}, Val={nv}")
+    print("="*80)
+    print(f"9v2 TRAIN MISSING COMPLETION - {role.upper()}")
+    print("="*80)
+    print(f"[{role}] Train={nt}, Val={nv}, Batch={batch}, Epochs={epochs}, Patience={patience}, Base={base}")
+    if nt % batch == 0 and nv % batch == 0:
+        print(f"[{role}] Batch plan: fixed/no remainder batches")
+    else:
+        print(f"[{role}] Warning: partial last batch; batch=40 recommended")
     ckpt = out_dir / f"best_missing_{role}.keras"
     callbacks = [
         keras.callbacks.ModelCheckpoint(str(ckpt), monitor="val_gap_dice", mode="max", save_best_only=True, verbose=1),
         keras.callbacks.EarlyStopping(monitor="val_gap_dice", mode="max", patience=patience, restore_best_weights=True, verbose=1),
         keras.callbacks.CSVLogger(str(out_dir / f"{role}_epoch_log.csv")),
     ]
-    hist = model.fit(train_ds, validation_data=val_ds, epochs=epochs, callbacks=callbacks)
+    hist = model.fit(train_ds, validation_data=val_ds, epochs=epochs, callbacks=callbacks, verbose=1)
     save_history(hist, out_dir, role)
     model.save(out_dir / f"final_missing_{role}.keras")
     return keras.models.load_model(ckpt, compile=False, safe_mode=False)
@@ -277,11 +284,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset-dir", default="dataset")
     ap.add_argument("--results-dir", default="results")
-    ap.add_argument("--epochs", type=int, default=80)
-    ap.add_argument("--batch-size", type=int, default=24)
+    ap.add_argument("--epochs", type=int, default=90)
+    ap.add_argument("--batch-size", type=int, default=40)
     ap.add_argument("--base-filters", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--patience", type=int, default=10)
+    ap.add_argument("--patience", type=int, default=12)
     ap.add_argument("--skip-teacher", action="store_true")
     ap.add_argument("--skip-student", action="store_true")
     args = ap.parse_args()

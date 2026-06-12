@@ -114,7 +114,7 @@ def make_ds(dataset_dir: Path, split: str, batch: int, shuffle=False, do_aug=Fal
     ds = ds.map(load_sample, num_parallel_calls=tf.data.AUTOTUNE)
     if do_aug:
         ds = ds.map(augment, num_parallel_calls=tf.data.AUTOTUNE)
-    return ds.batch(batch).prefetch(1), len(img)
+    return ds.batch(batch).prefetch(tf.data.AUTOTUNE), len(img)
 
 
 def conv_block(x, f, drop=0.0):
@@ -292,11 +292,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset-dir", default="dataset")
     ap.add_argument("--results-dir", default="results")
-    ap.add_argument("--epochs", type=int, default=80)
-    ap.add_argument("--batch-size", type=int, default=24)
+    ap.add_argument("--epochs", type=int, default=70)
+    ap.add_argument("--batch-size", type=int, default=40)
     ap.add_argument("--base-filters", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--patience", type=int, default=10)
+    ap.add_argument("--patience", type=int, default=12)
+    ap.add_argument("--show-summary", action="store_true")
     args = ap.parse_args()
 
     dataset_dir = Path(args.dataset_dir)
@@ -305,7 +306,14 @@ def main():
 
     train_ds, n_train = make_ds(dataset_dir, "train", args.batch_size, shuffle=True, do_aug=True)
     val_ds, n_val = make_ds(dataset_dir, "val", args.batch_size)
-    print(f"Train={n_train}, Val={n_val}")
+    print("="*80)
+    print("6v1 TRAIN VISIBLE A/B/C + ORDER CLASSIFIER")
+    print("="*80)
+    print(f"Train={n_train}, Val={n_val}, Batch={args.batch_size}, Epochs={args.epochs}, Patience={args.patience}")
+    if n_train % args.batch_size == 0 and n_val % args.batch_size == 0:
+        print("Batch plan: fixed/no remainder batches -> faster and less autotune overhead")
+    else:
+        print("Warning: batch size creates a last partial batch; batch=40 is recommended for 2800/600 split")
 
     model = build_model(base=args.base_filters)
     model.compile(
@@ -314,7 +322,10 @@ def main():
         loss_weights={"seg": 1.0, "order": 0.35},
         metrics={"seg": [dice_metric], "order": ["accuracy"]},
     )
-    model.summary()
+    if args.show_summary:
+        model.summary()
+    else:
+        print(f"Model params: {model.count_params():,}")
 
     ckpt = out_dir / "best_visible_order_teacher.keras"
     callbacks = [
@@ -322,7 +333,7 @@ def main():
         keras.callbacks.EarlyStopping(monitor="val_seg_dice_metric", mode="max", patience=args.patience, restore_best_weights=True, verbose=1),
         keras.callbacks.CSVLogger(str(out_dir / "train_visible_order_epoch_log.csv")),
     ]
-    hist = model.fit(train_ds, validation_data=val_ds, epochs=args.epochs, callbacks=callbacks)
+    hist = model.fit(train_ds, validation_data=val_ds, epochs=args.epochs, callbacks=callbacks, verbose=1)
     save_history(hist, out_dir)
     model.save(out_dir / "final_visible_order_teacher.keras")
 

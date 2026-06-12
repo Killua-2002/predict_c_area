@@ -1,0 +1,15 @@
+# generated runtime outputs
+generated_data/
+processed_data_256/
+dataset/
+results/
+result/
+checkpoint/
+checkpoints/
+*.keras
+*.h5
+*.pth
+*.pt
+*.zip
+__pycache__/
+.ipynb_checkpoints/
