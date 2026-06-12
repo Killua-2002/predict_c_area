@@ -23,9 +23,15 @@ import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 import tensorflow as tf
 from tensorflow import keras
+tf.get_logger().setLevel("ERROR")
+try:
+    import absl.logging
+    absl.logging.set_verbosity(absl.logging.ERROR)
+except Exception:
+    pass
 
 IMG_SIZE = 256
 EPS = 1e-7
@@ -291,12 +297,12 @@ def main():
     print(f"real_test samples: {len(names)} | Batch={args.batch_size}")
 
     print("Loading models from exact paths only, no recursive model search...")
-    visible_model = keras.models.load_model(visible_model_path, compile=False, safe_mode=False)
-    teacher = keras.models.load_model(teacher_path, compile=False, safe_mode=False)
-    student = keras.models.load_model(student_path, compile=False, safe_mode=False)
+    visible_model = keras.models.load_model(str(visible_model_path), compile=False, safe_mode=False)
+    teacher = keras.models.load_model(str(teacher_path), compile=False, safe_mode=False)
+    student = keras.models.load_model(str(student_path), compile=False, safe_mode=False)
 
     print("Step 1/3: Predict visible A/B/C and order with 6v1...")
-    vo_pred = visible_model.predict(X, batch_size=args.batch_size, verbose=1)
+    vo_pred = visible_model.predict(X, batch_size=args.batch_size, verbose=0)
     pred_visible_prob, pred_order_prob = unpack_visible_order_prediction(vo_pred)
     pred_visible = (pred_visible_prob >= 0.5).astype(np.float32)
     pred_order = np.argmax(pred_order_prob, axis=1).astype(np.int32)
@@ -304,8 +310,8 @@ def main():
     X_teacher, X_student = build_missing_inputs(X, pred_visible, pred_order)
 
     print("Step 2/3: Predict missing gaps with Teacher and Student from 6v1 outputs...")
-    pred_gap_teacher = (teacher.predict(X_teacher, batch_size=args.batch_size, verbose=1) >= 0.5).astype(np.float32)
-    pred_gap_student = (student.predict(X_student, batch_size=args.batch_size, verbose=1) >= 0.5).astype(np.float32)
+    pred_gap_teacher = (teacher.predict(X_teacher, batch_size=args.batch_size, verbose=0) >= 0.5).astype(np.float32)
+    pred_gap_student = (student.predict(X_student, batch_size=args.batch_size, verbose=0) >= 0.5).astype(np.float32)
 
     # Explicit C-rule hypotheses for report/debugging.
     # These represent the two possible interpretations of C before the order classifier chooses one.

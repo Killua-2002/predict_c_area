@@ -25,7 +25,7 @@ Outputs:
 """
 from __future__ import annotations
 
-import argparse, csv, json, os, random
+import argparse, csv, json, os, random, math, time, re
 from pathlib import Path
 from typing import Dict
 
@@ -33,9 +33,20 @@ import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 import tensorflow as tf
 from tensorflow import keras
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
+
+tf.get_logger().setLevel("ERROR")
+try:
+    import absl.logging
+    absl.logging.set_verbosity(absl.logging.ERROR)
+except Exception:
+    pass
 from tensorflow.keras import layers
 
 IMG_SIZE = 256
@@ -119,7 +130,7 @@ def make_ds(dataset_dir: Path, split: str, role: str, batch: int, shuffle=False,
     loader = load_teacher if role == "teacher" else load_student
     ds = ds.map(loader, num_parallel_calls=tf.data.AUTOTUNE)
     if do_aug: ds = ds.map(augment, num_parallel_calls=tf.data.AUTOTUNE)
-    return ds.batch(batch).prefetch(tf.data.AUTOTUNE), len(rows)
+    return ds.batch(batch).prefetch(1), len(rows)
 
 
 def conv(x, f, drop=0):
@@ -203,8 +214,9 @@ def make_np_inputs(dataset_dir: Path, split="real_test"):
 
 def eval_compare(teacher, student, dataset_dir: Path, out_dir: Path, batch_size=16, max_show=60):
     Xt, Xs, Y, names = make_np_inputs(dataset_dir, "real_test")
-    Pt = (teacher.predict(Xt, batch_size=batch_size, verbose=1) >= 0.5).astype(np.float32)
-    Ps = (student.predict(Xs, batch_size=batch_size, verbose=1) >= 0.5).astype(np.float32)
+    print(f"[9v2][eval] Predicting real_test: {len(names)} images ...")
+    Pt = (teacher.predict(Xt, batch_size=batch_size, verbose=0) >= 0.5).astype(np.float32)
+    Ps = (student.predict(Xs, batch_size=batch_size, verbose=0) >= 0.5).astype(np.float32)
 
     def dice_np(y, p):
         inter = np.sum(y*p, axis=(1,2))
@@ -254,43 +266,180 @@ def eval_compare(teacher, student, dataset_dir: Path, out_dir: Path, batch_size=
     return metrics
 
 
-def train_one(role, dataset_dir, out_dir, epochs, batch, base, lr, patience):
+def checkpoint_epoch(path: Path) -> int:
+    m = re.search(r"epoch_(\d+)\.weights\.h5$", path.name)
+    return int(m.group(1)) if m else -1
+
+
+def latest_weight_checkpoint(ckpt_dir: Path):
+    files = sorted(ckpt_dir.glob("epoch_*.weights.h5"), key=checkpoint_epoch)
+    files = [p for p in files if checkpoint_epoch(p) > 0]
+    if not files:
+        return 0, None
+    p = files[-1]
+    return checkpoint_epoch(p), p
+
+
+class KeepLastCheckpoints(keras.callbacks.Callback):
+    def __init__(self, ckpt_dir: Path, keep: int = 3):
+        super().__init__()
+        self.ckpt_dir = Path(ckpt_dir)
+        self.keep = int(max(1, keep))
+
+    def on_epoch_end(self, epoch, logs=None):
+        files = sorted(self.ckpt_dir.glob("epoch_*.weights.h5"), key=checkpoint_epoch)
+        for p in files[:-self.keep]:
+            try:
+                p.unlink()
+            except Exception:
+                pass
+
+
+class CleanProgressCallback(keras.callbacks.Callback):
+    def __init__(self, role: str, total_epochs: int, steps_per_epoch: int, mode: str = "line"):
+        super().__init__()
+        self.role = role
+        self.total_epochs = int(total_epochs)
+        self.steps_per_epoch = int(max(1, steps_per_epoch))
+        self.mode = mode
+        self.pbar = None
+        self.t0 = None
+
+    @staticmethod
+    def _get(logs, key, default=None):
+        if not logs:
+            return default
+        try:
+            return float(logs.get(key, default))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _fmt(v, percent=False):
+        if v is None:
+            return "-"
+        return f"{v*100:.2f}%" if percent else f"{v:.4f}"
+
+    def on_epoch_begin(self, epoch, logs=None):
+        self.t0 = time.time()
+        desc = f"[9v2][{self.role}] Epoch {epoch+1:03d}/{self.total_epochs:03d}"
+        if self.mode == "tqdm" and tqdm is not None:
+            self.pbar = tqdm(total=self.steps_per_epoch, desc=desc, unit="batch", leave=False, dynamic_ncols=True, mininterval=0.5)
+        else:
+            print(desc)
+
+    def on_train_batch_end(self, batch, logs=None):
+        logs = logs or {}
+        if self.pbar is not None:
+            self.pbar.update(1)
+            self.pbar.set_postfix({"loss": self._fmt(self._get(logs, "loss")), "dice": self._fmt(self._get(logs, "gap_dice"), percent=True)})
+        elif self.mode == "line":
+            step = batch + 1
+            if step == 1 or step == self.steps_per_epoch or step % max(1, self.steps_per_epoch // 5) == 0:
+                pct = step / self.steps_per_epoch * 100
+                print(f"  step {step:03d}/{self.steps_per_epoch:03d} ({pct:5.1f}%) | loss={self._fmt(self._get(logs,'loss'))} | dice={self._fmt(self._get(logs,'gap_dice'), percent=True)}")
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        if self.pbar is not None:
+            self.pbar.close(); self.pbar = None
+        sec = time.time() - self.t0 if self.t0 else 0.0
+        print(
+            f"[9v2][{self.role}][{epoch+1:03d}/{self.total_epochs:03d}] {sec:6.1f}s | "
+            f"loss={self._fmt(self._get(logs,'loss'))} | val_loss={self._fmt(self._get(logs,'val_loss'))} | "
+            f"dice={self._fmt(self._get(logs,'gap_dice'), percent=True)} | val_dice={self._fmt(self._get(logs,'val_gap_dice'), percent=True)}",
+            flush=True,
+        )
+
+
+def train_one(role, dataset_dir, out_dir, epochs, batch, base, lr, patience, resume=False, force_restart=False, progress_mode="line", max_keep_checkpoints=3):
     channels = 6 if role == "teacher" else 4
     model = build_unet(channels, base=base, name=f"missing_{role}")
     model.compile(optimizer=keras.optimizers.Adam(lr), loss=gap_loss, metrics=[gap_dice])
     train_ds, nt = make_ds(dataset_dir, "train", role, batch, True, True)
     val_ds, nv = make_ds(dataset_dir, "val", role, batch)
+    steps_per_epoch = math.ceil(nt / batch)
+    val_steps = math.ceil(nv / batch)
     print("="*80)
-    print(f"9v2 TRAIN MISSING COMPLETION - {role.upper()}")
+    print(f"9v2 MISSING COMPLETION {role.upper()} TRAINING")
     print("="*80)
-    print(f"[{role}] Train={nt}, Val={nv}, Batch={batch}, Epochs={epochs}, Patience={patience}, Base={base}")
-    if nt % batch == 0 and nv % batch == 0:
-        print(f"[{role}] Batch plan: fixed/no remainder batches")
-    else:
-        print(f"[{role}] Warning: partial last batch; batch=40 recommended")
+    print(f"Dataset: train={nt}, val={nv}")
+    print(f"Batch={batch} | steps/epoch={steps_per_epoch} | val_steps={val_steps}")
+    print(f"Epochs={epochs} | patience={patience} | base_filters={base} | lr={lr}")
+
     ckpt = out_dir / f"best_missing_{role}.keras"
+    final_path = out_dir / f"final_missing_{role}.keras"
+    ckpt_dir = out_dir / f"checkpoints_{role}"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    initial_epoch = 0
+    if force_restart:
+        print(f"[9v2][{role}] force restart: ignore old checkpoints")
+    elif resume:
+        last_epoch, last_ckpt = latest_weight_checkpoint(ckpt_dir)
+        if last_ckpt is not None:
+            model.load_weights(str(last_ckpt))
+            initial_epoch = last_epoch
+            print(f"[9v2][{role}] Resumed from {last_ckpt} -> initial_epoch={initial_epoch}")
+        elif final_path.exists():
+            loaded = keras.models.load_model(str(final_path), compile=False, safe_mode=False)
+            model.set_weights(loaded.get_weights())
+            print(f"[9v2][{role}] Loaded final model weights: {final_path}")
+        elif ckpt.exists():
+            loaded = keras.models.load_model(str(ckpt), compile=False, safe_mode=False)
+            model.set_weights(loaded.get_weights())
+            print(f"[9v2][{role}] Loaded best model weights: {ckpt}")
+        else:
+            print(f"[9v2][{role}] No checkpoint found, train from scratch")
+
     callbacks = [
-        keras.callbacks.ModelCheckpoint(str(ckpt), monitor="val_gap_dice", mode="max", save_best_only=True, verbose=1),
-        keras.callbacks.EarlyStopping(monitor="val_gap_dice", mode="max", patience=patience, restore_best_weights=True, verbose=1),
-        keras.callbacks.CSVLogger(str(out_dir / f"{role}_epoch_log.csv")),
+        keras.callbacks.ModelCheckpoint(str(ckpt), monitor="val_gap_dice", mode="max", save_best_only=True, verbose=0),
+        keras.callbacks.ModelCheckpoint(str(ckpt_dir / "epoch_{epoch:03d}.weights.h5"), save_weights_only=True, save_freq="epoch", verbose=0),
+        KeepLastCheckpoints(ckpt_dir, keep=max_keep_checkpoints),
+        keras.callbacks.EarlyStopping(monitor="val_gap_dice", mode="max", patience=patience, restore_best_weights=True, verbose=0),
+        keras.callbacks.CSVLogger(str(out_dir / f"{role}_epoch_log.csv"), append=bool(resume and initial_epoch > 0)),
     ]
-    hist = model.fit(train_ds, validation_data=val_ds, epochs=epochs, callbacks=callbacks, verbose=1)
-    save_history(hist, out_dir, role)
-    model.save(out_dir / f"final_missing_{role}.keras")
-    return keras.models.load_model(ckpt, compile=False, safe_mode=False)
+    fit_verbose = 1 if progress_mode == "keras" else 0
+    if progress_mode != "keras":
+        callbacks.insert(0, CleanProgressCallback(role, epochs, steps_per_epoch, progress_mode))
+
+    if initial_epoch >= epochs:
+        print(f"[9v2][{role}] Already reached epoch {initial_epoch}/{epochs}; skip training.")
+        hist = None
+    else:
+        hist = model.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=epochs,
+            initial_epoch=initial_epoch,
+            callbacks=callbacks,
+            verbose=fit_verbose,
+        )
+        if hist is not None and hist.history:
+            save_history(hist, out_dir, role)
+    model.save(str(final_path))
+    if not ckpt.exists():
+        model.save(str(ckpt))
+    print(f"[9v2][{role}] Saved best : {ckpt}")
+    print(f"[9v2][{role}] Saved final: {final_path}")
+    return keras.models.load_model(str(ckpt), compile=False, safe_mode=False)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset-dir", default="dataset")
     ap.add_argument("--results-dir", default="results")
-    ap.add_argument("--epochs", type=int, default=90)
-    ap.add_argument("--batch-size", type=int, default=40)
+    ap.add_argument("--epochs", type=int, default=80)
+    ap.add_argument("--batch-size", type=int, default=24)
     ap.add_argument("--base-filters", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--patience", type=int, default=12)
+    ap.add_argument("--patience", type=int, default=10)
     ap.add_argument("--skip-teacher", action="store_true")
     ap.add_argument("--skip-student", action="store_true")
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--force-restart", action="store_true")
+    ap.add_argument("--progress-mode", choices=["tqdm", "line", "keras"], default="line")
+    ap.add_argument("--max-keep-checkpoints", type=int, default=3)
     args = ap.parse_args()
 
     dataset_dir = Path(args.dataset_dir)
@@ -298,14 +447,14 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if not args.skip_teacher:
-        teacher = train_one("teacher", dataset_dir, out_dir, args.epochs, args.batch_size, args.base_filters, args.lr, args.patience)
+        teacher = train_one("teacher", dataset_dir, out_dir, args.epochs, args.batch_size, args.base_filters, args.lr, args.patience, args.resume, args.force_restart, args.progress_mode, args.max_keep_checkpoints)
     else:
-        teacher = keras.models.load_model(out_dir / "best_missing_teacher.keras", compile=False, safe_mode=False)
+        teacher = keras.models.load_model(str(out_dir / "best_missing_teacher.keras"), compile=False, safe_mode=False)
 
     if not args.skip_student:
-        student = train_one("student", dataset_dir, out_dir, args.epochs, args.batch_size, max(16, args.base_filters//2), args.lr, args.patience)
+        student = train_one("student", dataset_dir, out_dir, args.epochs, args.batch_size, max(16, args.base_filters//2), args.lr, args.patience, args.resume, args.force_restart, args.progress_mode, args.max_keep_checkpoints)
     else:
-        student = keras.models.load_model(out_dir / "best_missing_student.keras", compile=False, safe_mode=False)
+        student = keras.models.load_model(str(out_dir / "best_missing_student.keras"), compile=False, safe_mode=False)
 
     metrics = eval_compare(teacher, student, dataset_dir, out_dir, batch_size=args.batch_size)
     print(json.dumps(metrics, indent=2))

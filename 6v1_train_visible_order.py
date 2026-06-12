@@ -17,10 +17,11 @@ Output:
         metrics_visible_order_real_test.json
         confusion_order_heatmap.png
         visible_order_showcase.png
+        checkpoints/epoch_XXX.weights.h5 for resume
 """
 from __future__ import annotations
 
-import argparse, csv, json, os, random, shutil
+import argparse, csv, json, os, random, shutil, math, time, re
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -28,9 +29,20 @@ import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 import tensorflow as tf
 from tensorflow import keras
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
+
+tf.get_logger().setLevel("ERROR")
+try:
+    import absl.logging
+    absl.logging.set_verbosity(absl.logging.ERROR)
+except Exception:
+    pass
 from tensorflow.keras import layers
 
 IMG_SIZE = 256
@@ -114,7 +126,7 @@ def make_ds(dataset_dir: Path, split: str, batch: int, shuffle=False, do_aug=Fal
     ds = ds.map(load_sample, num_parallel_calls=tf.data.AUTOTUNE)
     if do_aug:
         ds = ds.map(augment, num_parallel_calls=tf.data.AUTOTUNE)
-    return ds.batch(batch).prefetch(tf.data.AUTOTUNE), len(img)
+    return ds.batch(batch).prefetch(1), len(img)
 
 
 def conv_block(x, f, drop=0.0):
@@ -153,24 +165,6 @@ def dice_metric(y_true, y_pred):
     inter = tf.reduce_sum(y_true * y_pred, axis=[1, 2])
     den = tf.reduce_sum(y_true + y_pred, axis=[1, 2])
     return tf.reduce_mean((2*inter + 1e-6) / (den + 1e-6))
-
-
-
-def unpack_visible_order_prediction(pred):
-    """Return (seg_prob, order_prob) for Keras dict/list outputs."""
-    if isinstance(pred, dict):
-        return pred["seg"], pred["order"]
-    if isinstance(pred, (list, tuple)):
-        seg = None; order = None
-        for item in pred:
-            arr = np.asarray(item)
-            if arr.ndim == 4 and arr.shape[-1] == 3:
-                seg = item
-            elif arr.ndim == 2 and arr.shape[-1] == 2:
-                order = item
-        if seg is not None and order is not None:
-            return seg, order
-    raise ValueError(f"Cannot unpack model prediction outputs: {type(pred)}")
 
 
 def dice_loss(y_true, y_pred):
@@ -230,7 +224,8 @@ def evaluate_real_test(model, dataset_dir: Path, out_dir: Path, batch_size: int 
     Y_seg = np.stack(Y_seg).astype(np.float32)
     Y_order = np.array(Y_order, dtype=np.int32)
 
-    pred = model.predict(X, batch_size=batch_size, verbose=1)
+    print(f"[6v1][eval] Predicting real_test: {len(names)} images ...")
+    pred = model.predict(X, batch_size=batch_size, verbose=0)
     pred_seg_prob, pred_order_prob = unpack_visible_order_prediction(pred)
     pred_seg = (pred_seg_prob >= 0.5).astype(np.float32)
     pred_order = np.argmax(pred_order_prob, axis=1)
@@ -288,16 +283,154 @@ def evaluate_real_test(model, dataset_dir: Path, out_dir: Path, batch_size: int 
     return metrics
 
 
+
+def unpack_visible_order_prediction(pred):
+    """Return (seg_prob, order_prob) for Keras dict/list outputs."""
+    if isinstance(pred, dict):
+        return pred["seg"], pred["order"]
+    if isinstance(pred, (list, tuple)):
+        seg = None
+        order = None
+        for item in pred:
+            arr = np.asarray(item)
+            if arr.ndim == 4 and arr.shape[-1] == 3:
+                seg = item
+            elif arr.ndim == 2 and arr.shape[-1] == 2:
+                order = item
+        if seg is not None and order is not None:
+            return seg, order
+    raise ValueError(f"Cannot unpack visible/order prediction outputs: {type(pred)}")
+
+
+def checkpoint_epoch(path: Path) -> int:
+    m = re.search(r"epoch_(\d+)\.weights\.h5$", path.name)
+    return int(m.group(1)) if m else -1
+
+
+def latest_weight_checkpoint(ckpt_dir: Path):
+    files = sorted(ckpt_dir.glob("epoch_*.weights.h5"), key=checkpoint_epoch)
+    files = [p for p in files if checkpoint_epoch(p) > 0]
+    if not files:
+        return 0, None
+    p = files[-1]
+    return checkpoint_epoch(p), p
+
+
+class KeepLastCheckpoints(keras.callbacks.Callback):
+    def __init__(self, ckpt_dir: Path, keep: int = 3):
+        super().__init__()
+        self.ckpt_dir = Path(ckpt_dir)
+        self.keep = int(max(1, keep))
+
+    def on_epoch_end(self, epoch, logs=None):
+        files = sorted(self.ckpt_dir.glob("epoch_*.weights.h5"), key=checkpoint_epoch)
+        extra = files[:-self.keep]
+        for p in extra:
+            try:
+                p.unlink()
+            except Exception:
+                pass
+
+
+class CleanProgressCallback(keras.callbacks.Callback):
+    """Clean notebook-friendly progress for 6v1.
+
+    - Hides Keras' noisy default progress output.
+    - Shows one tqdm bar per epoch in Colab/Jupyter.
+    - Prints one compact metric line after each epoch.
+    """
+    def __init__(self, total_epochs: int, steps_per_epoch: int, mode: str = "tqdm"):
+        super().__init__()
+        self.total_epochs = int(total_epochs)
+        self.steps_per_epoch = int(max(1, steps_per_epoch))
+        self.mode = mode
+        self.pbar = None
+        self.t0 = None
+
+    @staticmethod
+    def _get(logs, key, default=None):
+        if not logs:
+            return default
+        v = logs.get(key, default)
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _fmt(v, percent=False):
+        if v is None:
+            return "-"
+        return f"{v*100:.2f}%" if percent else f"{v:.4f}"
+
+    def on_epoch_begin(self, epoch, logs=None):
+        self.t0 = time.time()
+        desc = f"[6v1] Epoch {epoch+1:03d}/{self.total_epochs:03d}"
+        if self.mode == "tqdm" and tqdm is not None:
+            self.pbar = tqdm(
+                total=self.steps_per_epoch,
+                desc=desc,
+                unit="batch",
+                leave=False,
+                dynamic_ncols=True,
+                mininterval=0.5,
+            )
+        else:
+            print(desc)
+
+    def on_train_batch_end(self, batch, logs=None):
+        logs = logs or {}
+        if self.pbar is not None:
+            self.pbar.update(1)
+            self.pbar.set_postfix({
+                "loss": self._fmt(self._get(logs, "loss")),
+                "dice": self._fmt(self._get(logs, "seg_dice_metric"), percent=True),
+                "ord": self._fmt(self._get(logs, "order_accuracy"), percent=True),
+            })
+        elif self.mode == "line":
+            step = batch + 1
+            if step == 1 or step == self.steps_per_epoch or step % max(1, self.steps_per_epoch // 5) == 0:
+                pct = step / self.steps_per_epoch * 100
+                print(
+                    f"  step {step:03d}/{self.steps_per_epoch:03d} ({pct:5.1f}%) | "
+                    f"loss={self._fmt(self._get(logs, 'loss'))} | "
+                    f"dice={self._fmt(self._get(logs, 'seg_dice_metric'), percent=True)} | "
+                    f"order={self._fmt(self._get(logs, 'order_accuracy'), percent=True)}"
+                )
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        if self.pbar is not None:
+            self.pbar.close()
+            self.pbar = None
+        sec = time.time() - self.t0 if self.t0 else 0.0
+        msg = (
+            f"[6v1][{epoch+1:03d}/{self.total_epochs:03d}] "
+            f"{sec:6.1f}s | "
+            f"loss={self._fmt(self._get(logs, 'loss'))} | "
+            f"val_loss={self._fmt(self._get(logs, 'val_loss'))} | "
+            f"dice={self._fmt(self._get(logs, 'seg_dice_metric'), percent=True)} | "
+            f"val_dice={self._fmt(self._get(logs, 'val_seg_dice_metric'), percent=True)} | "
+            f"order={self._fmt(self._get(logs, 'order_accuracy'), percent=True)} | "
+            f"val_order={self._fmt(self._get(logs, 'val_order_accuracy'), percent=True)}"
+        )
+        print(msg, flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset-dir", default="dataset")
     ap.add_argument("--results-dir", default="results")
-    ap.add_argument("--epochs", type=int, default=70)
-    ap.add_argument("--batch-size", type=int, default=40)
+    ap.add_argument("--epochs", type=int, default=80)
+    ap.add_argument("--batch-size", type=int, default=24)
     ap.add_argument("--base-filters", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--patience", type=int, default=12)
+    ap.add_argument("--patience", type=int, default=10)
+    ap.add_argument("--progress-mode", choices=["tqdm", "line", "keras"], default="tqdm")
     ap.add_argument("--show-summary", action="store_true")
+    ap.add_argument("--resume", action="store_true", help="Resume from exact epoch_XXX.weights.h5 checkpoint if available")
+    ap.add_argument("--force-restart", action="store_true", help="Ignore checkpoints and train from scratch")
+    ap.add_argument("--max-keep-checkpoints", type=int, default=3)
     args = ap.parse_args()
 
     dataset_dir = Path(args.dataset_dir)
@@ -306,14 +439,15 @@ def main():
 
     train_ds, n_train = make_ds(dataset_dir, "train", args.batch_size, shuffle=True, do_aug=True)
     val_ds, n_val = make_ds(dataset_dir, "val", args.batch_size)
+    steps_per_epoch = math.ceil(n_train / args.batch_size)
+    val_steps = math.ceil(n_val / args.batch_size)
     print("="*80)
-    print("6v1 TRAIN VISIBLE A/B/C + ORDER CLASSIFIER")
+    print("6v1 VISIBLE A/B/C + ORDER TRAINING")
     print("="*80)
-    print(f"Train={n_train}, Val={n_val}, Batch={args.batch_size}, Epochs={args.epochs}, Patience={args.patience}")
-    if n_train % args.batch_size == 0 and n_val % args.batch_size == 0:
-        print("Batch plan: fixed/no remainder batches -> faster and less autotune overhead")
-    else:
-        print("Warning: batch size creates a last partial batch; batch=40 is recommended for 2800/600 split")
+    print(f"Dataset: train={n_train}, val={n_val}")
+    print(f"Batch={args.batch_size} | steps/epoch={steps_per_epoch} | val_steps={val_steps}")
+    print(f"Epochs={args.epochs} | patience={args.patience} | base_filters={args.base_filters} | lr={args.lr}")
+    print(f"Progress mode: {args.progress_mode}")
 
     model = build_model(base=args.base_filters)
     model.compile(
@@ -325,19 +459,66 @@ def main():
     if args.show_summary:
         model.summary()
     else:
-        print(f"Model params: {model.count_params():,}")
+        print(f"Model params: {model.count_params():,} (use --show-summary nếu muốn xem full summary)")
 
     ckpt = out_dir / "best_visible_order_teacher.keras"
-    callbacks = [
-        keras.callbacks.ModelCheckpoint(str(ckpt), monitor="val_seg_dice_metric", mode="max", save_best_only=True, verbose=1),
-        keras.callbacks.EarlyStopping(monitor="val_seg_dice_metric", mode="max", patience=args.patience, restore_best_weights=True, verbose=1),
-        keras.callbacks.CSVLogger(str(out_dir / "train_visible_order_epoch_log.csv")),
-    ]
-    hist = model.fit(train_ds, validation_data=val_ds, epochs=args.epochs, callbacks=callbacks, verbose=1)
-    save_history(hist, out_dir)
-    model.save(out_dir / "final_visible_order_teacher.keras")
+    final_model_path = out_dir / "final_visible_order_teacher.keras"
+    ckpt_dir = out_dir / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    best = keras.models.load_model(ckpt, compile=False, safe_mode=False)
+    initial_epoch = 0
+    if args.force_restart:
+        print("[6v1] force restart: ignore old checkpoints")
+    elif args.resume:
+        last_epoch, last_ckpt = latest_weight_checkpoint(ckpt_dir)
+        if last_ckpt is not None:
+            model.load_weights(str(last_ckpt))
+            initial_epoch = last_epoch
+            print(f"[6v1] Resumed from {last_ckpt} -> initial_epoch={initial_epoch}")
+        elif final_model_path.exists():
+            loaded = keras.models.load_model(str(final_model_path), compile=False, safe_mode=False)
+            model.set_weights(loaded.get_weights())
+            print(f"[6v1] Loaded final model weights: {final_model_path}")
+        elif ckpt.exists():
+            loaded = keras.models.load_model(str(ckpt), compile=False, safe_mode=False)
+            model.set_weights(loaded.get_weights())
+            print(f"[6v1] Loaded best model weights: {ckpt}")
+        else:
+            print("[6v1] No checkpoint found, train from scratch")
+
+    callbacks = [
+        keras.callbacks.ModelCheckpoint(str(ckpt), monitor="val_seg_dice_metric", mode="max", save_best_only=True, verbose=0),
+        keras.callbacks.ModelCheckpoint(str(ckpt_dir / "epoch_{epoch:03d}.weights.h5"), save_weights_only=True, save_freq="epoch", verbose=0),
+        KeepLastCheckpoints(ckpt_dir, keep=args.max_keep_checkpoints),
+        keras.callbacks.EarlyStopping(monitor="val_seg_dice_metric", mode="max", patience=args.patience, restore_best_weights=True, verbose=0),
+        keras.callbacks.CSVLogger(str(out_dir / "train_visible_order_epoch_log.csv"), append=bool(args.resume and initial_epoch > 0)),
+    ]
+    fit_verbose = 1 if args.progress_mode == "keras" else 0
+    if args.progress_mode != "keras":
+        callbacks.insert(0, CleanProgressCallback(args.epochs, steps_per_epoch, args.progress_mode))
+
+    if initial_epoch >= args.epochs:
+        print(f"[6v1] Already reached epoch {initial_epoch}/{args.epochs}; skip training and evaluate best model.")
+        hist = None
+    else:
+        hist = model.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=args.epochs,
+            initial_epoch=initial_epoch,
+            callbacks=callbacks,
+            verbose=fit_verbose,
+        )
+        if hist is not None and hist.history:
+            save_history(hist, out_dir)
+    model.save(str(final_model_path))
+    print(f"[6v1] Saved best model : {ckpt}")
+    print(f"[6v1] Saved final model: {out_dir / 'final_visible_order_teacher.keras'}")
+    print(f"[6v1] Saved history    : {out_dir / 'history_visible_order.csv'}")
+
+    if not ckpt.exists():
+        model.save(str(ckpt))
+    best = keras.models.load_model(str(ckpt), compile=False, safe_mode=False)
     metrics = evaluate_real_test(best, dataset_dir, out_dir, batch_size=args.batch_size)
     print(json.dumps(metrics, indent=2))
 
