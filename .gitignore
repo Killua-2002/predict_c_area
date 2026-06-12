@@ -2,7 +2,6 @@
 generated_data/
 source_data/
 processed_data_256/
-dataset/
 results/
 result/
 checkpoint/

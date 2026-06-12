@@ -1,0 +1,5 @@
+split,count
+train,2800
+val,600
+test,600
+real_test,1000
