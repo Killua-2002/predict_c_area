@@ -113,9 +113,9 @@ def make_ds(dataset_dir: Path, split: str, role: str, batch: int, shuffle=False,
         random.shuffle(rows)
     cols = list(zip(*rows))
     
-    paths_ds = tf.data.Dataset.from_tensor_slices(tuple(cols[:6]))
+    paths_ds = tf.data.Dataset.from_tensor_slices(tuple(list(c) for c in cols[:6]))
     paths_ds = paths_ds.map(load_paths, num_parallel_calls=tf.data.AUTOTUNE)
-    meta_ds = tf.data.Dataset.from_tensor_slices((cols[6], cols[7]))
+    meta_ds = tf.data.Dataset.from_tensor_slices((list(cols[6]), list(cols[7])))
     
     ds = tf.data.Dataset.zip((paths_ds, meta_ds))
 
