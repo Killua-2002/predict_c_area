@@ -200,12 +200,8 @@ def run_cmd(args: list[str | Path], title: str, check: bool = True) -> int:
 def maybe_mount_drive() -> None:
     if not USE_GOOGLE_DRIVE:
         return
-    try:
-        from google.colab import drive  # type: ignore
-
-        drive.mount("/content/drive", force_remount=True)
-    except Exception as exc:
-        raise RuntimeError("USE_GOOGLE_DRIVE=True but Google Drive could not be mounted.") from exc
+    # The Colab notebook already mounts the drive before running main.py.
+    # We just ensure the results directory exists.
     DRIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Local train/eval results: {RESULTS_DIR}")
     print(f"Drive backup/resume path: {DRIVE_RESULTS_DIR}")
