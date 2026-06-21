@@ -97,13 +97,12 @@ def read_mask(path):
     return m
 
 
-def load_sample(img_p, va_p, vb_p, c_p, top_class):
+def load_paths(img_p, va_p, vb_p, c_p):
     x = read_image(img_p)
     va, vb, c = read_mask(va_p), read_mask(vb_p), read_mask(c_p)
     y_seg = tf.concat([va, vb, c], axis=-1)
     y_seg.set_shape([IMG_SIZE, IMG_SIZE, 3])
-    y_order = tf.one_hot(tf.cast(top_class, tf.int32), 2)
-    return x, {"seg": y_seg, "order": y_order}
+    return x, y_seg
 
 
 def augment(x, y):
@@ -120,10 +119,22 @@ def augment(x, y):
 
 def make_ds(dataset_dir: Path, split: str, batch: int, shuffle=False, do_aug=False):
     img, va, vb, c, order = get_split_lists(dataset_dir, split)
-    ds = tf.data.Dataset.from_tensor_slices((img, va, vb, c, order))
     if shuffle:
-        ds = ds.shuffle(min(len(img), 4096), seed=SEED, reshuffle_each_iteration=True)
-    ds = ds.map(load_sample, num_parallel_calls=tf.data.AUTOTUNE)
+        import random
+        combined = list(zip(img, va, vb, c, order))
+        random.shuffle(combined)
+        img, va, vb, c, order = zip(*combined)
+        img, va, vb, c, order = list(img), list(va), list(vb), list(c), list(order)
+
+    path_ds = tf.data.Dataset.from_tensor_slices((img, va, vb, c))
+    path_ds = path_ds.map(load_paths, num_parallel_calls=tf.data.AUTOTUNE)
+
+    label_ds = tf.data.Dataset.from_tensor_slices(order)
+    label_ds = label_ds.map(lambda lbl: tf.one_hot(tf.cast(lbl, tf.int32), 2), num_parallel_calls=tf.data.AUTOTUNE)
+
+    ds = tf.data.Dataset.zip((path_ds, label_ds))
+    ds = ds.map(lambda p_out, l_out: (p_out[0], {"seg": p_out[1], "order": l_out}))
+
     if do_aug:
         ds = ds.map(augment, num_parallel_calls=tf.data.AUTOTUNE)
     return ds.batch(batch).prefetch(1), len(img)

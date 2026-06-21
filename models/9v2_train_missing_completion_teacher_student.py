@@ -92,25 +92,10 @@ def read_mask(path):
     m = tf.cast(m > 127, tf.float32); m.set_shape([IMG_SIZE, IMG_SIZE, 1]); return m
 
 
-def load_teacher(img_p, va_p, vb_p, c_p, ga_p, gb_p, order, name):
+def load_paths(img_p, va_p, vb_p, c_p, ga_p, gb_p):
     gray, va, vb, c = read_gray(img_p), read_mask(va_p), read_mask(vb_p), read_mask(c_p)
     ga, gb = read_mask(ga_p), read_mask(gb_p)
-    order = tf.cast(order, tf.int32)
-    top_a = tf.ones_like(gray) * tf.cast(tf.equal(order, 0), tf.float32)
-    top_b = tf.ones_like(gray) * tf.cast(tf.equal(order, 1), tf.float32)
-    x = tf.concat([gray, va, vb, c, top_a, top_b], axis=-1)
-    y = tf.concat([ga, gb], axis=-1)
-    x.set_shape([IMG_SIZE, IMG_SIZE, 6]); y.set_shape([IMG_SIZE, IMG_SIZE, 2])
-    return x, y
-
-
-def load_student(img_p, va_p, vb_p, c_p, ga_p, gb_p, order, name):
-    gray, va, vb, c = read_gray(img_p), read_mask(va_p), read_mask(vb_p), read_mask(c_p)
-    ga, gb = read_mask(ga_p), read_mask(gb_p)
-    x = tf.concat([gray, va, vb, c], axis=-1)
-    y = tf.concat([ga, gb], axis=-1)
-    x.set_shape([IMG_SIZE, IMG_SIZE, 4]); y.set_shape([IMG_SIZE, IMG_SIZE, 2])
-    return x, y
+    return gray, va, vb, c, ga, gb
 
 
 def augment(x, y):
@@ -123,12 +108,37 @@ def augment(x, y):
 
 def make_ds(dataset_dir: Path, split: str, role: str, batch: int, shuffle=False, do_aug=False):
     rows = get_split_lists(dataset_dir, split)
-    cols = list(zip(*rows))
-    ds = tf.data.Dataset.from_tensor_slices(cols)
     if shuffle:
-        ds = ds.shuffle(min(len(rows), 4096), seed=SEED, reshuffle_each_iteration=True)
-    loader = load_teacher if role == "teacher" else load_student
-    ds = ds.map(loader, num_parallel_calls=tf.data.AUTOTUNE)
+        import random
+        random.shuffle(rows)
+    cols = list(zip(*rows))
+    
+    paths_ds = tf.data.Dataset.from_tensor_slices(cols[:6])
+    paths_ds = paths_ds.map(load_paths, num_parallel_calls=tf.data.AUTOTUNE)
+    meta_ds = tf.data.Dataset.from_tensor_slices((cols[6], cols[7]))
+    
+    ds = tf.data.Dataset.zip((paths_ds, meta_ds))
+
+    if role == "teacher":
+        def assemble_teacher(paths_out, meta_out):
+            gray, va, vb, c, ga, gb = paths_out
+            order, name = meta_out
+            top_a = tf.ones_like(gray) * tf.cast(tf.equal(order, 0), tf.float32)
+            top_b = tf.ones_like(gray) * tf.cast(tf.equal(order, 1), tf.float32)
+            x = tf.concat([gray, va, vb, c, top_a, top_b], axis=-1)
+            y = tf.concat([ga, gb], axis=-1)
+            x.set_shape([IMG_SIZE, IMG_SIZE, 6]); y.set_shape([IMG_SIZE, IMG_SIZE, 2])
+            return x, y
+        ds = ds.map(assemble_teacher, num_parallel_calls=tf.data.AUTOTUNE)
+    else:
+        def assemble_student(paths_out, meta_out):
+            gray, va, vb, c, ga, gb = paths_out
+            x = tf.concat([gray, va, vb, c], axis=-1)
+            y = tf.concat([ga, gb], axis=-1)
+            x.set_shape([IMG_SIZE, IMG_SIZE, 4]); y.set_shape([IMG_SIZE, IMG_SIZE, 2])
+            return x, y
+        ds = ds.map(assemble_student, num_parallel_calls=tf.data.AUTOTUNE)
+
     if do_aug: ds = ds.map(augment, num_parallel_calls=tf.data.AUTOTUNE)
     return ds.batch(batch).prefetch(1), len(rows)
 
