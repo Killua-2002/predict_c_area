@@ -187,16 +187,14 @@ def gap_dice(y_true, y_pred):
 
 
 def save_history(hist, out_dir: Path, name: str):
-    data = {k:[float(x) for x in v] for k,v in hist.history.items()}
-    with open(out_dir / f"{name}_history.json", "w", encoding="utf-8") as f: json.dump(data, f, indent=2)
-    keys = list(data.keys())
-    with open(out_dir / f"{name}_history.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f); w.writerow(["epoch"] + keys)
-        for i in range(len(next(iter(data.values())))): w.writerow([i+1] + [data[k][i] for k in keys])
+    csv_path = out_dir / f"{name}_epoch_log.csv"
+    if not csv_path.exists(): return
+    import pandas as pd
+    df = pd.read_csv(csv_path)
     for key, title in [("loss", "Loss"), ("gap_dice", "Gap Dice")]:
         plt.figure(figsize=(7,4))
-        if key in data: plt.plot(data[key], label="train")
-        if "val_"+key in data: plt.plot(data["val_"+key], label="val")
+        if key in df.columns: plt.plot(df["epoch"], df[key], label="train")
+        if "val_"+key in df.columns: plt.plot(df["epoch"], df["val_"+key], label="val")
         plt.title(f"{name} {title}"); plt.xlabel("Epoch"); plt.ylabel(title); plt.legend(); plt.tight_layout()
         plt.savefig(out_dir / f"{name}_{key}_curve.png", dpi=160); plt.close()
 

@@ -192,19 +192,16 @@ def seg_loss(y_true, y_pred):
 
 def save_history(history, out_dir: Path):
     out_dir.mkdir(parents=True, exist_ok=True)
-    hist = {k: [float(x) for x in v] for k, v in history.history.items()}
-    with open(out_dir / "history_visible_order.json", "w", encoding="utf-8") as f:
-        json.dump(hist, f, indent=2)
-    keys = list(hist.keys())
-    with open(out_dir / "history_visible_order.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f); w.writerow(["epoch"] + keys)
-        for i in range(len(next(iter(hist.values())))):
-            w.writerow([i+1] + [hist[k][i] for k in keys])
+    csv_path = out_dir / "train_visible_order_epoch_log.csv"
+    if not csv_path.exists():
+        return
+    import pandas as pd
+    df = pd.read_csv(csv_path)
 
     for metric_name, title in [("loss", "Total loss"), ("seg_dice_metric", "Segmentation Dice"), ("order_accuracy", "Order accuracy")]:
         plt.figure(figsize=(7,4))
-        if metric_name in hist: plt.plot(hist[metric_name], label="train")
-        if "val_" + metric_name in hist: plt.plot(hist["val_" + metric_name], label="val")
+        if metric_name in df.columns: plt.plot(df["epoch"], df[metric_name], label="train")
+        if "val_" + metric_name in df.columns: plt.plot(df["epoch"], df["val_" + metric_name], label="val")
         plt.title(title); plt.xlabel("Epoch"); plt.ylabel(title); plt.legend(); plt.tight_layout()
         plt.savefig(out_dir / f"curve_{metric_name}.png", dpi=160); plt.close()
 
