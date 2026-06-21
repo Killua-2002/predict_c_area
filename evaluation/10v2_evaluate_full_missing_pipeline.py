@@ -1,4 +1,4 @@
-﻿"""
+"""
 10v2_evaluate_full_missing_pipeline.py
 Run the complete missing-part prediction pipeline on the 1,000-image real_test split.
 
@@ -55,7 +55,7 @@ def np_gray(path: Path):
 
 def np_mask(path: Path):
     arr = np.array(Image.open(path).convert("L").resize((IMG_SIZE, IMG_SIZE))).astype(np.float32)
-    return (arr > 127).astype(np.float32)
+    return (arr > 127).astype(np.uint8)
 
 
 def load_real_test(dataset_dir: Path):
@@ -87,9 +87,9 @@ def load_real_test(dataset_dir: Path):
 
     return (
         np.stack(X).astype(np.float32),
-        np.stack(y_visible).astype(np.float32),
-        np.stack(y_full).astype(np.float32),
-        np.stack(y_gap).astype(np.float32),
+        np.stack(y_visible).astype(np.uint8),
+        np.stack(y_full).astype(np.uint8),
+        np.stack(y_gap).astype(np.uint8),
         np.array(y_order, dtype=np.int32),
         names,
     )
@@ -137,8 +137,10 @@ def make_c_rule_candidates(pred_visible, pred_gap):
 
 
 def dice_per_channel(y_true, y_pred):
-    inter = np.sum(y_true * y_pred, axis=(0, 1, 2))
-    den = np.sum(y_true + y_pred, axis=(0, 1, 2))
+    y_true_f = y_true.astype(np.float32)
+    y_pred_f = y_pred.astype(np.float32)
+    inter = np.sum(y_true_f * y_pred_f, axis=(0, 1, 2))
+    den = np.sum(y_true_f + y_pred_f, axis=(0, 1, 2))
     return (2 * inter + EPS) / (den + EPS)
 
 
@@ -152,14 +154,34 @@ def pixel_acc(y_true, y_pred):
     return float(np.mean(y_true == y_pred))
 
 
-def build_missing_inputs(X_gray, pred_visible, pred_order):
-    top_a = (pred_order == 0).astype(np.float32)[:, None, None, None]
-    top_b = (pred_order == 1).astype(np.float32)[:, None, None, None]
-    top_a_map = np.ones_like(X_gray) * top_a
-    top_b_map = np.ones_like(X_gray) * top_b
-    X_teacher = np.concatenate([X_gray, pred_visible, top_a_map, top_b_map], axis=-1).astype(np.float32)
-    X_student = np.concatenate([X_gray, pred_visible], axis=-1).astype(np.float32)
-    return X_teacher, X_student
+def chunked_predict_teacher(model, X, pred_visible, pred_order, batch_size, chunk_size=200):
+    preds = []
+    for i in range(0, len(X), chunk_size):
+        X_chunk = X[i:i+chunk_size]
+        p_vis_chunk = pred_visible[i:i+chunk_size]
+        p_ord_chunk = pred_order[i:i+chunk_size]
+        
+        top_a = (p_ord_chunk == 0).astype(np.float32)[:, None, None, None]
+        top_b = (p_ord_chunk == 1).astype(np.float32)[:, None, None, None]
+        top_a_map = np.ones_like(X_chunk) * top_a
+        top_b_map = np.ones_like(X_chunk) * top_b
+        X_in = np.concatenate([X_chunk, p_vis_chunk, top_a_map, top_b_map], axis=-1).astype(np.float32)
+        
+        pred = (model.predict(X_in, batch_size=batch_size, verbose=0) >= 0.5).astype(np.uint8)
+        preds.append(pred)
+    return np.concatenate(preds, axis=0).astype(np.float32)
+
+def chunked_predict_student(model, X, pred_visible, pred_order, batch_size, chunk_size=200):
+    preds = []
+    for i in range(0, len(X), chunk_size):
+        X_chunk = X[i:i+chunk_size]
+        p_vis_chunk = pred_visible[i:i+chunk_size]
+        
+        X_in = np.concatenate([X_chunk, p_vis_chunk], axis=-1).astype(np.float32)
+        
+        pred = (model.predict(X_in, batch_size=batch_size, verbose=0) >= 0.5).astype(np.uint8)
+        preds.append(pred)
+    return np.concatenate(preds, axis=0).astype(np.float32)
 
 
 def reconstruct_full(pred_visible, pred_gap, pred_order):
@@ -307,11 +329,9 @@ def main():
     pred_visible = (pred_visible_prob >= 0.5).astype(np.float32)
     pred_order = np.argmax(pred_order_prob, axis=1).astype(np.int32)
 
-    X_teacher, X_student = build_missing_inputs(X, pred_visible, pred_order)
-
     print("Step 2/3: Predict missing gaps with Teacher and Student from 6v1 outputs...")
-    pred_gap_teacher = (teacher.predict(X_teacher, batch_size=args.batch_size, verbose=0) >= 0.5).astype(np.float32)
-    pred_gap_student = (student.predict(X_student, batch_size=args.batch_size, verbose=0) >= 0.5).astype(np.float32)
+    pred_gap_teacher = chunked_predict_teacher(teacher, X, pred_visible, pred_order, args.batch_size)
+    pred_gap_student = chunked_predict_student(student, X, pred_visible, pred_order, args.batch_size)
 
     # Explicit C-rule hypotheses for report/debugging.
     # These represent the two possible interpretations of C before the order classifier chooses one.
