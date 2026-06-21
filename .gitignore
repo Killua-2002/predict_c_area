@@ -1,16 +1,17 @@
 # generated runtime outputs
 generated_data/
-source_data/
 processed_data_256/
+prepared_single_chromosomes/
 results/
 result/
 checkpoint/
 checkpoints/
+venv/
+__pycache__/
+.ipynb_checkpoints/
 *.keras
 *.h5
 *.pth
 *.pt
 *.zip
-__pycache__/
-.ipynb_checkpoints/
 10v1_evaluate_full_missing_pipeline(for strong CPUram).py
