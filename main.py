@@ -160,7 +160,7 @@ MAX_SHOWCASE = env_int("MAX_SHOWCASE", MAX_SHOWCASE)
 FORCE_RECOMPUTE_CACHE = env_bool("FORCE_RECOMPUTE_CACHE", FORCE_RECOMPUTE_CACHE)
 SAVE_CANDIDATES = env_bool("SAVE_CANDIDATES", SAVE_CANDIDATES)
 PREVIEW_MODE = os.environ.get("PREVIEW_MODE", PREVIEW_MODE)
-PROGRESS_MODE = os.environ.get("PROGRESS_MODE", PROGRESS_MODE)
+PROGRESS_MODE = os.environ.get("PROGRESS_MODE", "keras")
 
 RESULTS_DIR = LOCAL_RESULTS_DIR
 
@@ -178,18 +178,12 @@ def run_cmd(args: list[str | Path], title: str, check: bool = True) -> int:
     print(title)
     print("=" * 90)
     print("$", command_text(args))
+    sys.stdout.flush()
     t0 = time.time()
     proc = subprocess.Popen(
         [str(a) for a in args],
         cwd=PROJECT_ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
     )
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        print(line, end="")
     code = proc.wait()
     print(f"\n[exit={code}] elapsed={time.time() - t0:.1f}s")
     if check and code != 0:
@@ -363,6 +357,9 @@ def run_pipeline() -> None:
     print_dataset_contract()
 
     if RUN_PREPARE_SINGLE_CHROMOSOMES:
+        print("\n" + "#" * 90)
+        print("### BƯỚC 1: TIỀN XỬ LÝ - CHUẨN BỊ SINGLE CHROMOSOMES ###")
+        print("#" * 90)
         run_cmd(
             py_script("preprocessing/2v1_prepare_single_chromosomes.py")
             + [
@@ -376,6 +373,9 @@ def run_pipeline() -> None:
         )
 
     if RUN_GENERATE_SYNTHETIC_IMAGES:
+        print("\n" + "#" * 90)
+        print("### BƯỚC 2: TIỀN XỬ LÝ - TẠO DỮ LIỆU TỔNG HỢP (SYNTHETIC) ###")
+        print("#" * 90)
         run_cmd(
             py_script("preprocessing/3v1_generate_synthetic_masks.py")
             + [
@@ -398,6 +398,9 @@ def run_pipeline() -> None:
         )
 
     if RUN_PREPROCESS_TO_SIZE:
+        print("\n" + "#" * 90)
+        print(f"### BƯỚC 3: TIỀN XỬ LÝ - RESIZE ẢNH VỀ {IMAGE_SIZE}x{IMAGE_SIZE} ###")
+        print("#" * 90)
         run_cmd(
             py_script("preprocessing/4v1_preprocess_to_256.py")
             + [
@@ -413,6 +416,9 @@ def run_pipeline() -> None:
         )
 
     if RUN_SPLIT_DATA:
+        print("\n" + "#" * 90)
+        print("### BƯỚC 4: TIỀN XỬ LÝ - CHIA TẬP TRAIN / VAL / TEST ###")
+        print("#" * 90)
         run_cmd(
             py_script("preprocessing/5v1_split_data.py")
             + [
@@ -436,6 +442,9 @@ def run_pipeline() -> None:
         )
 
     if RUN_MODEL_VISIBLE_ORDER:
+        print("\n" + "#" * 90)
+        print("### BƯỚC 5: HUẤN LUYỆN MODEL 1 (VISIBLE MASKS & ORDER) ###")
+        print("#" * 90)
         restore_results_from_drive()
         cmd = (
             py_script("models/6v1_train_visible_order.py")
@@ -468,6 +477,9 @@ def run_pipeline() -> None:
         backup_stage_to_drive("visible_order")
 
     if RUN_MODEL_MISSING_COMPLETION:
+        print("\n" + "#" * 90)
+        print("### BƯỚC 6: HUẤN LUYỆN MODEL 2 (MISSING COMPLETION - TEACHER & STUDENT) ###")
+        print("#" * 90)
         restore_results_from_drive()
         cmd = (
             py_script("models/9v2_train_missing_completion_teacher_student.py")
@@ -504,6 +516,9 @@ def run_pipeline() -> None:
         backup_stage_to_drive("missing_completion")
 
     if RUN_EVALUATE_FULL_PIPELINE:
+        print("\n" + "#" * 90)
+        print("### BƯỚC 7: ĐÁNH GIÁ TỔNG THỂ (EVALUATE FULL PIPELINE) ###")
+        print("#" * 90)
         backup_stage_to_drive("missing_completion")
         restore_results_from_drive()
         cmd = (
