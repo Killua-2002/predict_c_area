@@ -183,7 +183,18 @@ def run_cmd(args: list[str | Path], title: str, check: bool = True) -> int:
     proc = subprocess.Popen(
         [str(a) for a in args],
         cwd=PROJECT_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
     )
+    assert proc.stdout is not None
+    while True:
+        char = proc.stdout.read(1)
+        if not char:
+            break
+        sys.stdout.write(char)
+        sys.stdout.flush()
     code = proc.wait()
     print(f"\n[exit={code}] elapsed={time.time() - t0:.1f}s")
     if check and code != 0:
