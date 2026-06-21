@@ -1,0 +1,6 @@
+﻿numpy
+matplotlib
+tensorflow
+Pillow
+opencv-python
+tqdm
